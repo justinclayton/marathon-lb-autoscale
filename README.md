@@ -25,11 +25,15 @@ Specific options:
         --cooldown Integer           Number of additional intervals to wait after making a scale change (Default: 5)
         --target-rps Integer         Target number of requests per second per app instance (Default: 1000)
         --apps [APPS]                Comma separated list of <app>_<service port> pairs to monitor
+        --marathonCredentials [MarathonCredentials]
+                                     Colon separated string of <username>:<password>
+        --haproxyCredentials [HAProxyCredentials]
+                                     Colon separated string of <username>:<password>
         --threshold-percent Float    Scaling will occur when the target RPS differs from the current RPS by at least this amount (Default: 0.5)
         --threshold-instances Integer
                                      Scaling will occur when the target number of instances differs from the actual number by at least this amount (Default: 3)
-        --intervals-past-threshold Integer
-                                     An app won't be scaled until it's past it's threshold for this many intervals (Default: 3)
+        --max-instances Integer      Maximum number of instances an app may be scaled to (Default: a huge number)
+        --min-instances Integer      Minimum number of instances an app must have (Default: 1)
 
 Common options:
     -h, --help                       Show this message

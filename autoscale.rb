@@ -10,6 +10,9 @@ require 'net/http'
 require 'set'
 require 'json'
 require 'resolv'
+require 'jwt'
+require 'openssl'
+require 'pry'
 
 class Integer
   N_BYTES = [42].pack('i').size
@@ -33,6 +36,8 @@ class Optparser
     options.intervals_past_threshold = 3
     options.marathonCredentials =  []
     options.haproxyCredentials = []
+    options.dcos = ""
+    options.dcos_secret = {}
     options.max_instances = Integer::MAX
     options.min_instances = 1
 
@@ -45,6 +50,10 @@ class Optparser
       opts.on("--marathon URL", URI,
               "URL for Marathon") do |value|
         options.marathon = value
+      end
+
+      opts.on("--dcos URL", URI, "URL for DCOS") do |value|
+        options.dcos = value
       end
 
       opts.on("--haproxy [URLs]",
@@ -83,6 +92,10 @@ class Optparser
 
       opts.on("--haproxyCredentials [HAProxyCredentials]", "Colon separated string of <username>:<password>") do |value|
         options.haproxyCredentials = value.split(/:/)
+      end
+
+      opts.on("--dcosSecretEnvVar [DcosSecretEnvVar]", "name of env var containing service login token, if using DCOS with security enabled") do |value|
+        options.dcos_secret = JSON.parse(ENV[value])
       end
 
       opts.on("--threshold-percent Float", Float, "Scaling will occur when the target RPS " +
@@ -162,6 +175,7 @@ class Autoscale
     while true
       begin
         haproxy_data = []
+        @log.info "haproxy stuff START"
         @options.haproxy.map do |haproxy|
           Resolv.getaddresses(haproxy.host).each do |host|
             uri = haproxy.clone
@@ -169,22 +183,34 @@ class Autoscale
             haproxy_data << sample(uri)
           end
         end
+        @log.info "haproxy stuff END"
+        @log.info "aggregate_haproxy_data START"
         aggregate_haproxy_data(haproxy_data)
+        @log.info "aggregate_haproxy_data END"
 
+        @log.info "update_current_marathon_instances START"
         update_current_marathon_instances
+        @log.info "update_current_marathon_instances END"
 
+        @log.info "calculate_target_instances START"
         calculate_target_instances
+        @log.info "calculate_target_instances END"
 
         if total_samples >= @options.samples
           scale_list = build_scaling_list
           if !scale_list.empty?
             @log.info("#{scale_list.length} apps require scaling")
+          else
+            @log.info "scale_list is empty, no apps require scaling now i guess"
           end
 
+          @log.info "scale_apps START"
           scale_apps(scale_list)
+          @log.info "scale_apps END"
         end
 
         total_samples += 1
+        @log.info "total_samples now #{total_samples}"
       rescue Exception => msg
         @log.error("Caught exception: " + msg.to_s)
         @log.error(msg.backtrace)
@@ -270,15 +296,19 @@ class Autoscale
 
   def update_current_marathon_instances
     req = Net::HTTP::Get.new('/v2/apps')
+    @options.dcos_auth_token ||= dcos_auth_token
+    req["Authorization"] = "token=#{@options.dcos_auth_token}"
+
     if !@options.marathonCredentials.empty?
       req.basic_auth @options.marathonCredentials[0], @options.marathonCredentials[1]
     end
 
-    res = Net::HTTP.start(@options.marathon.host,
-                          @options.marathon.port) {|http|
-      http.request(req)
-    }
+    http = Net::HTTP.new(@options.marathon.host, @options.marathon.port)
+    # http.set_debug_output(@log)
+    res = http.request(req)
+    res.value
     apps = JSON.parse(res.body)
+    @log.info("Found #{apps.length} apps")
 
     instances = {}
     apps['apps'].each do |app|
@@ -312,6 +342,9 @@ class Autoscale
     @apps.each do |app,data|
       app_id = app.match(/(.*)_\d+$/)[1]
       app_id = app_id.dup.gsub '_', '/' # support for folders.
+
+      @log.info("app_id=#{app_id} rate_avg=#{data[:rate_avg]}/#{data[:current_instances]} " +
+                "target_rps=#{@options.target_rps} current_rps=#{data[:rate_avg] / data[:current_instances]}")
 
       # Scale if: the target and current instances don't match, we've exceed the
       # threshold difference, and a scale operation wasn't performed recently
@@ -352,7 +385,12 @@ class Autoscale
 
   def scale_apps(scale_list)
     scale_list.each do |app,instances|
+      @log.info "Scaling #{app} to #{instances} instances..."
       req = Net::HTTP::Put.new('/v2/apps/' + app)
+
+      @options.dcos_auth_token ||= dcos_auth_token
+      req["Authorization"] = "token=#{@options.dcos_auth_token}"
+
       if !@options.marathonCredentials.empty?
         req.basic_auth(@options.marathonCredentials[0],
                        @options.marathonCredentials[1])
@@ -360,11 +398,38 @@ class Autoscale
       req.content_type = 'application/json'
       req.body = JSON.generate({'instances'=>instances})
 
-      Net::HTTP.new(@options.marathon.host,
-                    @options.marathon.port).start do |http|
+      res = Net::HTTP.new(@options.marathon.host, @options.marathon.port).start do |http|
         http.request(req)
       end
+
+      @log.info "Success!"
+      res
     end
+  end
+
+  def service_login_token
+    JWT.encode(
+      {:uid => @options.dcos_secret['uid']},
+      OpenSSL::PKey::RSA.new(@options.dcos_secret['private_key']),
+      @options.dcos_secret['scheme']
+    )
+  end
+
+  def dcos_auth_token
+    req = Net::HTTP::Post.new('/acs/api/v1/auth/login')
+    req.content_type = 'application/json'
+    req.body = JSON.generate({
+      'uid' => @options.dcos_secret['uid'],
+      'token' => service_login_token
+    })
+    http = Net::HTTP.new(@options.dcos.host, @options.dcos.port)
+    # http.set_debug_output(@log)
+    if @options.dcos.scheme == 'https'
+      http.use_ssl = true
+      http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    end
+    res = http.request(req)
+    JSON.parse(res.body)['token']
   end
 end
 
